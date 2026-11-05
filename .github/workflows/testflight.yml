@@ -1,0 +1,181 @@
+name: testflight
+
+# Every 30 minutes, check u9g/t3code's focus-mode branch. If its head hasn't been uploaded
+# yet, build the iOS app from it and upload it to TestFlight. Each upload is recorded as a
+# release tagged focus-<sha>, which is how later runs know a commit is already done.
+on:
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if the branch head is already on TestFlight
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths: [.github/workflows/testflight.yml, scripts/**]
+
+concurrency:
+  group: testflight
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: u9g/t3code
+  SOURCE_BRANCH: focus-mode
+  BUNDLE_ID: com.u9g.t3code
+  TEAM_ID: M39T7MP49D
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.head.outputs.sha }}
+      build: ${{ steps.head.outputs.build }}
+    steps:
+      - id: head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          sha=$(git ls-remote "https://github.com/$SOURCE_REPO" "refs/heads/$SOURCE_BRANCH" | cut -f1)
+          [ -n "$sha" ] || { echo "::error::$SOURCE_REPO has no $SOURCE_BRANCH branch."; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" != true ] && gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/focus-$sha" --silent 2>/dev/null; then
+            echo "$SOURCE_BRANCH @ ${sha:0:8} is already on TestFlight."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$SOURCE_BRANCH @ ${sha:0:8} needs a build."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  ios:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: macos-26
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      SHA: ${{ needs.check.outputs.sha }}
+      KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      APP_VARIANT: production
+      # Upstream's OTA channel serves T3's own bundles; this build only runs the JS it ships with.
+      T3CODE_MOBILE_UPDATES_ENABLED: "0"
+      EXPO_NO_GIT_STATUS: "1"
+      CI: "1"
+      NODE_OPTIONS: --max-old-space-size=8192
+    steps:
+      - name: App Store Connect key
+        env:
+          API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+        run: |
+          if [ -z "$API_KEY" ] || [ -z "$KEY_ID" ] || [ -z "$ISSUER_ID" ]; then
+            echo "::error::Missing repo secrets APP_STORE_CONNECT_API_KEY / _KEY_ID / _ISSUER_ID (see README)."
+            exit 1
+          fi
+          KEY_PATH="$RUNNER_TEMP/asc/key.p8"
+          mkdir -p "$(dirname "$KEY_PATH")"
+          printf '%s\n' "$API_KEY" > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          echo "KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
+      # The t3code checkout is the workspace root, like upstream's own mobile workflows expect.
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SHA }}
+      - uses: actions/checkout@v5
+        with:
+          path: .ci
+
+      - name: Bundle IDs and App Store Connect app
+        run: node .ci/scripts/asc.mjs "$BUNDLE_ID" "$BUNDLE_ID.widgets" "$BUNDLE_ID.sharing"
+
+      - name: Point the app at your team
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}.${{ github.run_attempt }}
+        run: node .ci/scripts/patch-app-config.mjs apps/mobile/app.config.ts
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: |
+            args:
+              - --filter=@t3tools/mobile...
+
+      - name: Expose pnpm
+        run: |
+          pnpm_version="$(node --print "require('./package.json').packageManager.split('@').pop()")"
+          vp_pnpm_bin="$HOME/.vite-plus/package_manager/pnpm/$pnpm_version/pnpm/bin"
+          echo "$vp_pnpm_bin" >> "$GITHUB_PATH"
+          "$vp_pnpm_bin/pnpm" --version
+
+      - name: Select newest Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode_2*.app 2>/dev/null | grep -v beta | sort -V | tail -1)
+          [ -n "$XC" ] && sudo xcode-select -s "$XC"
+          xcodebuild -version
+
+      - name: Prebuild
+        working-directory: apps/mobile
+        run: |
+          pnpm exec expo config --type public | grep -nE 'bundleIdentifier|appleTeamId|buildNumber|"version"' || :
+          pnpm exec expo prebuild --platform ios --clean
+          ws=$(ls -d ios/*.xcworkspace | head -1)
+          echo "WORKSPACE=$ws" >> "$GITHUB_ENV"
+          echo "SCHEME=$(basename "$ws" .xcworkspace)" >> "$GITHUB_ENV"
+
+      - name: Archive
+        working-directory: apps/mobile
+        run: |
+          set -o pipefail
+          xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release \
+            -destination generic/platform=iOS -archivePath build/T3Code.xcarchive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO DEVELOPMENT_TEAM="$TEAM_ID" \
+            -skipPackagePluginValidation -quiet archive
+          xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release \
+            -destination generic/platform=iOS -showBuildSettings -json > build/settings.json
+
+      - name: Put the entitlements in the archive
+        working-directory: apps/mobile
+        run: node ../../.ci/scripts/sign-archive.mjs build/T3Code.xcarchive build/settings.json "$TEAM_ID"
+
+      - name: Upload to TestFlight
+        working-directory: apps/mobile
+        run: |
+          cat > build/exportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>uploadSymbols</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive -archivePath build/T3Code.xcarchive \
+            -exportOptionsPlist build/exportOptions.plist -exportPath build/export \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_PATH" -authenticationKeyID "$KEY_ID" -authenticationKeyIssuerID "$ISSUER_ID"
+
+      - name: Record the upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_NUMBER: ${{ github.run_number }}.${{ github.run_attempt }}
+        run: |
+          tag="focus-$SHA"
+          subject=$(git log -1 --format=%s "$SHA")
+          notes="TestFlight build $BUILD_NUMBER of [\`$SOURCE_BRANCH\` @ \`${SHA:0:8}\`](https://github.com/$SOURCE_REPO/commit/$SHA): $subject"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$tag" -R "$GITHUB_REPOSITORY" --notes "$notes"
+          else
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "build $BUILD_NUMBER · ${SHA:0:8}" --notes "$notes"
+          fi
