@@ -53,8 +53,15 @@ for (const { target, buildSettings: s } of JSON.parse(readFileSync(settingsPath,
     if (vars[name] === undefined) throw new Error(`${file}: unknown build setting ${m}`);
     return vars[name];
   });
+  // expo-notifications writes the development APNs environment; App Store builds need production.
   const out = join(tmp, `${target}.entitlements`);
-  writeFileSync(out, expanded);
+  writeFileSync(
+    out,
+    expanded.replace(
+      /(<key>aps-environment<\/key>\s*<string>)development(<\/string>)/,
+      "$1production$2",
+    ),
+  );
   signed.set(path, out);
   console.log(`${target}: ${product} gets ${s.CODE_SIGN_ENTITLEMENTS}`);
 }

@@ -143,8 +143,9 @@ jobs:
             -destination generic/platform=iOS -archivePath build/T3Code.xcarchive \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO DEVELOPMENT_TEAM="$TEAM_ID" \
             -skipPackagePluginValidation -quiet archive
-          xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release \
-            -destination generic/platform=iOS -showBuildSettings -json > build/settings.json
+          # Per target: the scheme's settings leave out the widget and share extensions.
+          xcodebuild -project "ios/$SCHEME.xcodeproj" -alltargets -configuration Release \
+            -sdk iphoneos -showBuildSettings -json > build/settings.json
 
       - name: Put the entitlements in the archive
         working-directory: apps/mobile
