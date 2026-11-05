@@ -12,6 +12,10 @@ on:
         description: Build even if the branch head is already on TestFlight
         type: boolean
         default: false
+      dry_run:
+        description: Build and sign only; skip App Store Connect and the upload (needs no secrets)
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths: [.github/workflows/testflight.yml, scripts/**]
@@ -68,6 +72,7 @@ jobs:
       NODE_OPTIONS: --max-old-space-size=8192
     steps:
       - name: App Store Connect key
+        if: ${{ !inputs.dry_run }}
         env:
           API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
         run: |
@@ -91,6 +96,7 @@ jobs:
           path: .ci
 
       - name: Bundle IDs and App Store Connect app
+        if: ${{ !inputs.dry_run }}
         run: node .ci/scripts/asc.mjs "$BUNDLE_ID" "$BUNDLE_ID.widgets" "$BUNDLE_ID.sharing"
 
       - name: Point the app at your team
@@ -145,6 +151,7 @@ jobs:
         run: node ../../.ci/scripts/sign-archive.mjs build/T3Code.xcarchive build/settings.json "$TEAM_ID"
 
       - name: Upload to TestFlight
+        if: ${{ !inputs.dry_run }}
         working-directory: apps/mobile
         run: |
           cat > build/exportOptions.plist <<PLIST
@@ -166,6 +173,7 @@ jobs:
             -authenticationKeyPath "$KEY_PATH" -authenticationKeyID "$KEY_ID" -authenticationKeyIssuerID "$ISSUER_ID"
 
       - name: Record the upload
+        if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
           BUILD_NUMBER: ${{ github.run_number }}.${{ github.run_attempt }}
